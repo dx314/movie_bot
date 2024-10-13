@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -209,50 +210,6 @@ func addNZBToSABnzbd(nzbURL, category string) (string, error) {
 	return result.NzoIDs[0], nil
 }
 
-func calculateSimilarity(s1, s2 string) float64 {
-	pairs1 := make(map[string]int)
-	pairs2 := make(map[string]int)
-
-	// Create character pairs
-	for i := 0; i < len(s1)-1; i++ {
-		pair := s1[i : i+2]
-		pairs1[pair]++
-	}
-
-	for i := 0; i < len(s2)-1; i++ {
-		pair := s2[i : i+2]
-		pairs2[pair]++
-	}
-
-	// Count matching pairs
-	matchingPairs := 0
-	for pair, count := range pairs1 {
-		if count2, found := pairs2[pair]; found {
-			if count2 < count {
-				matchingPairs += count2
-			} else {
-				matchingPairs += count
-			}
-		}
-	}
-
-	// Calculate similarity
-	totalPairs := len(s1) + len(s2) - 2
-	if totalPairs == 0 {
-		return 0
-	}
-	similarity := float64(2*matchingPairs) / float64(totalPairs)
-
-	log.Printf("Similarity calculation details:")
-	log.Printf("String 1: %s", s1)
-	log.Printf("String 2: %s", s2)
-	log.Printf("Matching pairs: %d", matchingPairs)
-	log.Printf("Total pairs: %d", totalPairs)
-	log.Printf("Calculated similarity: %f", similarity)
-
-	return similarity
-}
-
 // Define NZBGeek category IDs
 var nzbGeekCategories = map[string]string{
 	"movies":      "2000",
@@ -282,7 +239,7 @@ type Item struct {
 	PubDate     string    `xml:"pubDate"`
 }
 
-func searchNZBGeek(imdbID string, category string) (SearchResult, error) {
+func lookupNZBGeek(imdbID string, category string) (SearchResult, error) {
 	apiKey := os.Getenv("NZBGEEK_API_KEY")
 	baseURL := "https://api.nzbgeek.info/api"
 
@@ -315,6 +272,10 @@ func searchNZBGeek(imdbID string, category string) (SearchResult, error) {
 	}
 
 	totalFound := len(rss.Channel.Items)
+
+	if totalFound == 0 {
+		return SearchResult{}, nil
+	}
 
 	// Sort items by publication date (most recent first)
 	sort.Slice(rss.Channel.Items, func(i, j int) bool {
@@ -395,4 +356,188 @@ func updateNZBStatus(nzbUUID, status, message string) error {
 	editMessage(currentInfo.ChatID, int(currentInfo.MessageID), message)
 
 	return nil
+}
+
+func searchNZBGeek(movieName string, year string, category string) (SearchResult, error) {
+	apiKey := os.Getenv("NZBGEEK_API_KEY")
+	baseURL := "https://api.nzbgeek.info/api"
+
+	movieName = strings.ReplaceAll(movieName, " ", ".")
+	movieName = strings.ReplaceAll(movieName, "'", "")
+	movieName = strings.ReplaceAll(movieName, "’", "")
+	movieName = strings.ReplaceAll(movieName, ":", "")
+
+	fmt.Printf("Movie Name: %s\n", movieName)
+
+	query := url.QueryEscape(fmt.Sprintf("%s %s", movieName, year))
+	categoryID := nzbGeekCategories[category]
+	if categoryID == "" {
+		categoryID = "2000" // Default to movies if category is not found
+	}
+
+	fullURL := fmt.Sprintf("%s?apikey=%s&t=search&cat=%s&q=%s", baseURL, apiKey, categoryID, query)
+
+	fmt.Printf("Fetching from NZBGeek: %s\n", fullURL)
+
+	resp, err := http.Get(fullURL)
+	if err != nil {
+		return SearchResult{}, fmt.Errorf("error fetching from NZBGeek: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return SearchResult{}, fmt.Errorf("error reading response body: %w", err)
+	}
+
+	var rss RSS
+	err = xml.Unmarshal(body, &rss)
+	if err != nil {
+		return SearchResult{}, fmt.Errorf("error decoding XML: %w (XML Content: %s)", err, string(body))
+	}
+
+	totalFound := len(rss.Channel.Items)
+
+	// Filter the results
+	//searchQuery := fmt.Sprintf("%s %s", movieName, year)
+	//filteredItems := filterNZBResults(searchQuery, rss.Channel.Items, 0.6)
+
+	// Sort filtered items by publication date (most recent first)
+	sort.Slice(rss.Channel.Items, func(i, j int) bool {
+		timeI, _ := time.Parse(time.RFC1123Z, rss.Channel.Items[i].PubDate)
+		timeJ, _ := time.Parse(time.RFC1123Z, rss.Channel.Items[j].PubDate)
+		return timeI.After(timeJ)
+	})
+
+	// Prepare the result
+	result := SearchResult{
+		TotalFound:     totalFound,
+		FilteredCount:  0,
+		RemainingCount: len(rss.Channel.Items),
+	}
+
+	// Return the 10 most recent items
+	if len(rss.Channel.Items) > 9 {
+		result.Items = rss.Channel.Items[:9]
+	} else {
+		result.Items = rss.Channel.Items
+	}
+
+	return result, nil
+}
+
+func filterNZBResults(searchQuery string, items []Item, threshold float64) []Item {
+	if threshold == 0 {
+		threshold = 0.6 // Default threshold if not specified
+	}
+
+	log.Printf("Filtering results for query: %s with threshold: %f", searchQuery, threshold)
+	log.Printf("Total items before filtering: %d", len(items))
+
+	searchQuery = strings.ToLower(searchQuery)
+	searchParts := strings.Fields(searchQuery)
+
+	normalizedSearch := strings.ReplaceAll(searchQuery, " ", ".")
+	normalizedSearch = strings.ReplaceAll(normalizedSearch, "'", "")
+	normalizedSearch = strings.ReplaceAll(normalizedSearch, "’", "")
+	normalizedSearch = strings.ReplaceAll(normalizedSearch, ":", "")
+
+	var filteredItems []Item
+
+	for _, item := range items {
+		normalizedTitle := strings.ToLower(item.Title)
+		cleanedTitle := strings.ReplaceAll(normalizedTitle, " ", ".")
+		cleanedTitle = strings.ReplaceAll(cleanedTitle, "'", "")
+		cleanedTitle = strings.ReplaceAll(cleanedTitle, "’", "")
+		cleanedTitle = strings.ReplaceAll(cleanedTitle, ":", "")
+
+		if strings.HasPrefix(cleanedTitle, normalizedSearch) {
+			filteredItems = append(filteredItems, item)
+			continue
+		}
+
+		// Check if all parts of the search query are in the cleaned title
+		allPartsPresent := true
+		for _, part := range searchParts {
+			if !strings.Contains(cleanedTitle, part) {
+				allPartsPresent = false
+				log.Printf("Part '%s' not found in cleaned title", part)
+				break
+			}
+		}
+
+		if allPartsPresent {
+			log.Printf("All parts present in cleaned title")
+			similarity := calculateSimilarity(normalizedSearch, cleanedTitle)
+			log.Printf("Similarity between '%s' and '%s': %f", normalizedSearch, cleanedTitle, similarity)
+
+			if similarity >= threshold {
+				log.Printf("Item passed threshold, adding to filtered results")
+				filteredItems = append(filteredItems, item)
+			} else {
+				log.Printf("Item did not pass threshold")
+			}
+		} else {
+			log.Printf("Not all parts present, skipping similarity check")
+		}
+	}
+
+	log.Printf("Total items after filtering: %d", len(filteredItems))
+	return filteredItems
+}
+
+func cleanupTitle(title string, year string) string {
+	// Remove everything after the year
+	yearIndex := strings.Index(title, year)
+	if yearIndex != -1 {
+		title = title[:yearIndex+len(year)]
+	}
+
+	// Remove common separators and clean up spaces
+	title = regexp.MustCompile(`[.\-_]`).ReplaceAllString(title, " ")
+	title = regexp.MustCompile(`\s+`).ReplaceAllString(title, " ")
+	return strings.TrimSpace(title)
+}
+func calculateSimilarity(s1, s2 string) float64 {
+	pairs1 := make(map[string]int)
+	pairs2 := make(map[string]int)
+
+	// Create character pairs
+	for i := 0; i < len(s1)-1; i++ {
+		pair := s1[i : i+2]
+		pairs1[pair]++
+	}
+
+	for i := 0; i < len(s2)-1; i++ {
+		pair := s2[i : i+2]
+		pairs2[pair]++
+	}
+
+	// Count matching pairs
+	matchingPairs := 0
+	for pair, count := range pairs1 {
+		if count2, found := pairs2[pair]; found {
+			if count2 < count {
+				matchingPairs += count2
+			} else {
+				matchingPairs += count
+			}
+		}
+	}
+
+	// Calculate similarity
+	totalPairs := len(s1) + len(s2) - 2
+	if totalPairs == 0 {
+		return 0
+	}
+	similarity := float64(2*matchingPairs) / float64(totalPairs)
+
+	log.Printf("Similarity calculation details:")
+	log.Printf("String 1: %s", s1)
+	log.Printf("String 2: %s", s2)
+	log.Printf("Matching pairs: %d", matchingPairs)
+	log.Printf("Total pairs: %d", totalPairs)
+	log.Printf("Calculated similarity: %f", similarity)
+
+	return similarity
 }

@@ -166,3 +166,17 @@ func parseMovieTitle(s string) MovieInfo {
 		LastTag:    lastTag,
 	}
 }
+
+func addLeadingZero(n int) string {
+	if n >= 0 && n <= 9 {
+		return fmt.Sprintf("0%d", n)
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+func strAddLeadingZero(s string) string {
+	if len(s) == 1 {
+		return fmt.Sprintf("0%s", s)
+	}
+	return s
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -30,6 +31,45 @@ var CategoryToType = map[string]string{
 	"tv":          "series",
 	"kids_movies": "movie",
 	"kids_tv":     "series",
+}
+
+func lookupSeries(name, year string) (*OMDBTVSearchResponse, error) {
+	apiKey := os.Getenv("OMDB_API_KEY")
+	if apiKey == "" {
+		log.Println("OMDB_API_KEY environment variable is not set")
+		return nil, fmt.Errorf("OMDB_API_KEY environment variable is not set")
+	}
+
+	params := url.Values{}
+	params.Add("apikey", apiKey)
+	params.Add("t", name)
+	params.Add("y", year)
+
+	fullURL := omdbBaseURL + "?" + params.Encode()
+	log.Printf("Requesting URL: %s", fullURL)
+
+	resp, err := http.Get(fullURL)
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var result OMDBTVSearchResponse
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read OMDB response: %v", err)
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		fmt.Println(string(body))
+		return nil, fmt.Errorf("failed to unmarshal OMDB response: %v", err)
+	}
+
+	if result.Response == "False" {
+		return nil, fmt.Errorf(result.Error)
+	}
+
+	return &result, nil
 }
 
 func searchOMDB(title, year, category string) ([]OMDBSearchResult, error) {

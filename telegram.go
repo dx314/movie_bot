@@ -126,6 +126,71 @@ func sendResultsAsButtons(chatID int64, msgData *db.MsgDatum, items []Item) {
 
 // handleCallbackQuery handles the callback query when a user selects an option
 func handleCallbackQuery(query *tgbotapi.CallbackQuery) {
+	// Defer the deletion of the message data
+	defer func(msgID int) {
+		err := queries.DeleteMessageData(context.Background(), msgID)
+		if err != nil {
+			log.Printf("Error deleting message data for msg %d: %v", query.Message.MessageID, err)
+		}
+
+		// Delete the OMDB results message
+		deleteMsg := tgbotapi.NewDeleteMessage(query.Message.Chat.ID, query.Message.MessageID)
+		if _, err := bot.Request(deleteMsg); err != nil {
+			log.Printf("Error deleting OMDB results message: %v", err)
+		}
+	}(query.Message.MessageID)
+
+	if strings.HasPrefix(query.Data, "tvimdb:") {
+		parts := strings.Split(strings.TrimPrefix(query.Data, "tvimdb:"), ":")
+		imdbID := parts[0]
+		season := "S" + strAddLeadingZero(parts[1])
+
+		msgData, err := queries.GetMessageData(context.Background(), query.Message.MessageID)
+		if err != nil {
+			fmt.Printf("no row found for message id %d\n", query.Message.MessageID)
+			panic(err)
+		}
+		if msgData.Category == "" {
+			panic("Category not set in message data")
+		}
+
+		callback := tgbotapi.NewCallback(query.ID, "Searching for NZBs...")
+		if _, err := bot.Request(callback); err != nil {
+			log.Printf("Error answering callback query: %v", err)
+		}
+
+		searchResult, err := searchNZBGeek(msgData.Search+"."+season+".", "", msgData.Category)
+		if err != nil {
+			errorMsg := fmt.Sprintf("Error searching NZBGeek: %v", err)
+			log.Println(errorMsg)
+			msg := tgbotapi.NewMessage(query.Message.Chat.ID, errorMsg)
+			bot.Send(msg)
+			return
+		}
+
+		if searchResult.RemainingCount == 0 {
+			if searchResult.TotalFound == 0 {
+				msg := tgbotapi.NewMessage(query.Message.Chat.ID, fmt.Sprintf("No results found for: %s (%s)", msgData.Search, imdbID))
+				bot.Send(msg)
+			} else {
+				sendResultsAsButtons(query.Message.Chat.ID, &msgData, searchResult.Items)
+				if searchResult.FilteredCount > 0 {
+					infoMsg := fmt.Sprintf("Found %d results. %d were filtered out, showing %d relevant results.",
+						searchResult.TotalFound, searchResult.FilteredCount, len(searchResult.Items))
+					bot.Send(tgbotapi.NewMessage(query.Message.Chat.ID, infoMsg))
+				}
+			}
+		} else {
+			sendResultsAsButtons(query.Message.Chat.ID, &msgData, searchResult.Items)
+			if searchResult.FilteredCount > 0 {
+				infoMsg := fmt.Sprintf("Found %d results. %d were filtered out, showing %d relevant results.",
+					searchResult.TotalFound, searchResult.FilteredCount, len(searchResult.Items))
+				bot.Send(tgbotapi.NewMessage(query.Message.Chat.ID, infoMsg))
+			}
+		}
+		return
+	}
+
 	if strings.HasPrefix(query.Data, "imdb:") {
 		imdbID := strings.TrimPrefix(query.Data, "imdb:")
 		msgData, err := queries.GetMessageData(context.Background(), query.Message.MessageID)
@@ -142,13 +207,25 @@ func handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 			log.Printf("Error answering callback query: %v", err)
 		}
 
-		searchResult, err := searchNZBGeek(imdbID, msgData.Category)
+		searchResult, err := lookupNZBGeek(imdbID, msgData.Category)
 		if err != nil {
-			errorMsg := fmt.Sprintf("Error searching NZBGeek: %v", err)
+			errorMsg := fmt.Sprintf("Error looking up on NZBGeek: %v", err)
 			log.Println(errorMsg)
 			msg := tgbotapi.NewMessage(query.Message.Chat.ID, errorMsg)
 			bot.Send(msg)
 			return
+		}
+
+		if searchResult.TotalFound == 0 {
+			log.Println("Searching NZBGeek as fallback...")
+			searchResult, err = searchNZBGeek(msgData.Search, msgData.Year, msgData.Category)
+			if err != nil {
+				errorMsg := fmt.Sprintf("Error searching NZBGeek: %v", err)
+				log.Println(errorMsg)
+				msg := tgbotapi.NewMessage(query.Message.Chat.ID, errorMsg)
+				bot.Send(msg)
+				return
+			}
 		}
 
 		if searchResult.RemainingCount == 0 {
@@ -161,17 +238,6 @@ func handleCallbackQuery(query *tgbotapi.CallbackQuery) {
 					searchResult.TotalFound, searchResult.FilteredCount, len(searchResult.Items))
 				bot.Send(tgbotapi.NewMessage(query.Message.Chat.ID, infoMsg))
 			}
-		}
-
-		err = queries.DeleteMessageData(context.Background(), query.Message.MessageID)
-		if err != nil {
-			log.Printf("Error deleting message data for msg %d: %v", query.Message.MessageID, err)
-		}
-
-		// Delete the OMDB results message
-		deleteMsg := tgbotapi.NewDeleteMessage(query.Message.Chat.ID, query.Message.MessageID)
-		if _, err := bot.Request(deleteMsg); err != nil {
-			log.Printf("Error deleting OMDB results message: %v", err)
 		}
 
 		return
@@ -321,11 +387,21 @@ func handleCommand(message *tgbotapi.Message) {
 	case "start":
 		msg := tgbotapi.NewMessage(message.Chat.ID, "Welcome! Use /movie [movie name] [year] to search for movies.")
 		bot.Send(msg)
-	case "km":
-		fallthrough
 	case "ktv":
 		fallthrough
 	case "tv":
+		args := message.CommandArguments()
+		if args == "" {
+			us := UserState{ChatID: message.Chat.ID, State: "input", Category: cat, CreatedAt: time.Now()}
+			UserStates.Set(message.From.ID, us)
+
+			msg := tgbotapi.NewMessage(message.Chat.ID, "Please provide the name and year.")
+			bot.Send(msg)
+			return
+		} else {
+			doTVCommand(message, cat, args)
+		}
+	case "km":
 		fallthrough
 	case "movie":
 		args := message.CommandArguments()
@@ -343,6 +419,87 @@ func handleCommand(message *tgbotapi.Message) {
 		msg := tgbotapi.NewMessage(message.Chat.ID, "I don't know that command. Use /movie, /tv, /km (kids movies), or /ktv (kids TV) to search.")
 		bot.Send(msg)
 	}
+}
+
+func doTVCommand(message *tgbotapi.Message, cat string, args string) {
+	name, year := parseMovieCommand(args)
+	omdbResults, err := lookupSeries(name, year)
+	if err != nil {
+		log.Printf("OMDB search failed: %v", err)
+		msg := tgbotapi.NewMessage(message.Chat.ID, "No results found.")
+		bot.Send(msg)
+		return
+	}
+
+	totalSeasons, err := strconv.Atoi(omdbResults.TotalSeasons)
+	if err != nil {
+		omdbItems := []OMDBSearchResult{
+			{
+				Title:  omdbResults.Title,
+				Year:   omdbResults.Year,
+				Type:   "series",
+				ImdbID: omdbResults.ImdbID,
+			},
+		}
+		sendOMDBResultsAsButtons(message.Chat.ID, cat, name, omdbResults.Year, omdbItems)
+	}
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	for i := 0; i < totalSeasons+1; i++ {
+		s := addLeadingZero(i)
+		if s == "00" {
+			s = "00 - Specials"
+		}
+		buttonText := fmt.Sprintf("S%s", s)
+		button := tgbotapi.NewInlineKeyboardButtonData(buttonText, fmt.Sprintf("tvimdb:%s:%s", omdbResults.ImdbID, s))
+		buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(button))
+	}
+
+	// Add the cancel button as the 10th button
+	cancelButton := tgbotapi.NewInlineKeyboardButtonData("❌ Cancel", "cancel")
+	buttons = append(buttons, []tgbotapi.InlineKeyboardButton{cancelButton})
+
+	msg, err := bot.SendMessageWithButtons(message.Chat.ID, omdbResults.Title, buttons)
+	if err != nil {
+		log.Printf("Error sending message with buttons: %v", err)
+	}
+
+	if _, err := queries.InsertMessageData(context.Background(), db.InsertMessageDataParams{
+		MessageID: msg.MessageID,
+		UserID:    msg.From.ID,
+		Category:  cat,
+		Search:    args,
+		Year:      omdbResults.Year,
+	}); err != nil {
+		log.Printf("Error inserting message data: %v", err)
+	}
+
+}
+
+func parseTVCommand(args string) (string, string, string) {
+	words := strings.Fields(args)
+	if len(words) < 2 {
+		return "", "", ""
+	}
+
+	var name, season, year string
+	nameEnd := len(words) - 2
+
+	// Check if the last word is a year
+	if _, err := strconv.Atoi(words[len(words)-1]); err == nil {
+		year = words[len(words)-1]
+		nameEnd--
+	}
+
+	// Check if the second last word (or last if year was found) is a season
+	if strings.HasPrefix(strings.ToLower(words[nameEnd]), "s") {
+		season = words[nameEnd]
+		nameEnd--
+	}
+
+	// Join the remaining words as the episode name
+	name = strings.Join(words[:nameEnd+1], " ")
+
+	return name, season, year
 }
 
 func doMovieCommand(message *tgbotapi.Message, cat string, args string) {
