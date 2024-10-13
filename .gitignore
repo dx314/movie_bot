@@ -1,5 +1,8 @@
 .env
 nzbot.db
+
+deploy.sh
+
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json

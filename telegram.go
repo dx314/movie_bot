@@ -17,8 +17,17 @@ import (
 	"time"
 )
 
+var messageCache = make(map[int]string)
+
 // editMessage edits a message with the given text
 func editMessage(chatID int64, messageID int, text string) error {
+	s, _ := messageCache[messageID]
+	if s == text {
+		return nil
+	}
+
+	messageCache[messageID] = text
+
 	fmt.Printf("editMessage: %v, %v, %v\n", chatID, messageID, text)
 	msg := tgbotapi.NewEditMessageText(chatID, messageID, text)
 	_, err := bot.Send(msg)

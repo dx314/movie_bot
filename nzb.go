@@ -406,6 +406,36 @@ func searchNZBGeek(movieName string, year string, category string) (SearchResult
 	sort.Slice(rss.Channel.Items, func(i, j int) bool {
 		timeI, _ := time.Parse(time.RFC1123Z, rss.Channel.Items[i].PubDate)
 		timeJ, _ := time.Parse(time.RFC1123Z, rss.Channel.Items[j].PubDate)
+
+		if categoryID == "5000" {
+			title := strings.ToLower(rss.Channel.Items[i].Title)
+			titleJ := strings.ToLower(rss.Channel.Items[j].Title)
+			normSearchQuery := strings.ToLower(strings.ReplaceAll(movieName, " ", "."))
+
+			// check if title prefix matches movieNamerss.Channel.Items[i].Title
+			if strings.HasPrefix(title, normSearchQuery) && !strings.HasPrefix(titleJ, normSearchQuery) {
+				return true
+			}
+			// check if all parts of the search query are in the title
+			allPartsPresent := true
+			for _, part := range strings.Fields(strings.ReplaceAll(normSearchQuery, ".", " ")) {
+				if !strings.Contains(title, part) {
+					allPartsPresent = false
+					break
+				}
+			}
+			foundInJ := true
+			for _, part := range strings.Fields(strings.ReplaceAll(normSearchQuery, ".", " ")) {
+				if !strings.Contains(titleJ, part) {
+					foundInJ = false
+					break
+				}
+			}
+			if allPartsPresent && !foundInJ {
+				return true
+			}
+		}
+
 		return timeI.After(timeJ)
 	})
 
